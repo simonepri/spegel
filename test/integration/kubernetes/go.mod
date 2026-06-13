@@ -8,6 +8,7 @@ require (
 	github.com/fluxcd/cli-utils v1.2.1
 	github.com/go-openapi/testify/v2 v2.5.1
 	github.com/moby/moby/client v0.4.1
+	github.com/opencontainers/image-spec v1.1.1
 	github.com/spegel-org/spegel v0.0.0-00010101000000-000000000000
 	golang.org/x/sync v0.20.0
 	helm.sh/helm/v4 v4.2.0
@@ -16,7 +17,6 @@ require (
 	k8s.io/cli-runtime v0.36.1
 	k8s.io/client-go v0.36.1
 	k8s.io/kubectl v0.36.1
-	k8s.io/utils v0.0.0-20260319190234-28399d86e0b5
 	sigs.k8s.io/kind v0.32.0
 )
 
@@ -167,7 +167,6 @@ require (
 	github.com/multiformats/go-varint v0.1.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect
-	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/opencontainers/runtime-spec v1.3.0 // indirect
 	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58 // indirect
 	github.com/pelletier/go-toml v1.9.5 // indirect
@@ -254,6 +253,7 @@ require (
 	k8s.io/klog/v2 v2.140.0 // indirect
 	k8s.io/kube-openapi v0.0.0-20260319004828-5883c5ee87b9 // indirect
 	k8s.io/streaming v0.36.1 // indirect
+	k8s.io/utils v0.0.0-20260319190234-28399d86e0b5 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 	oras.land/oras-go/v2 v2.6.0 // indirect
 	sigs.k8s.io/controller-runtime v0.24.1 // indirect
