@@ -376,6 +376,10 @@ func installSpegel(t *testing.T, actionCfg *action.Configuration, k8sClient kube
 		"spegel": map[string]any{
 			"logLevel":             "DEBUG",
 			"mirrorResolveTimeout": "100ms",
+			"estargz": map[string]any{
+				"enabled":      true,
+				"pollInterval": "2s",
+			},
 		},
 		"nodeSelector": map[string]any{
 			nodeTaintKey: "true",
@@ -924,17 +928,24 @@ func TestKubernetesStargz(t *testing.T) {
 		require.NotContains(t, lazyContent, layerDgst)
 	}
 
-	// The lazy pulling node has the manifest and config in its content store but not the
-	// layers, so it advertises and serves only the content it can actually serve while
-	// the seed serves the whole image.
-	t.Log("Checking that the lazy pulling node only serves content it has")
+	t.Log("Waiting for the lazy pulling node to become a seed")
 	repoPath := strings.TrimPrefix(estargzImageRef, "ghcr.io/")
 	repoPath = strings.Split(repoPath, ":")[0]
-	require.EqualT(t, http.StatusOK, getContentStatus(t, k8sClient, seedNode, repoPath, oci.DistributionKindManifest, manifestDgst))
 	require.EqualT(t, http.StatusOK, getContentStatus(t, k8sClient, lazyNode, repoPath, oci.DistributionKindManifest, manifestDgst))
+	require.EventuallyWith(t, func(c *assert.CollectT) {
+		for _, layerDgst := range layerDgsts {
+			require.EqualT(c, http.StatusOK, getContentStatus(t, k8sClient, lazyNode, repoPath, oci.DistributionKindBlob, layerDgst))
+		}
+	}, 60*time.Second, 2*time.Second)
+
+	t.Log("Pulling the eStargz image from the lazy pulling node after removing it from the seed")
+	err = seedNode.CommandContext(t.Context(), "crictl", "rmi", estargzImageRef).Run()
+	require.NoError(t, err)
+	blockRegistries(t, seedNode)
+	pullImages(t, seedNode, []string{estargzImageRef})
+	seedContent := listContent(t, seedNode)
 	for _, layerDgst := range layerDgsts {
-		require.EqualT(t, http.StatusOK, getContentStatus(t, k8sClient, seedNode, repoPath, oci.DistributionKindBlob, layerDgst))
-		require.EqualT(t, http.StatusNotFound, getContentStatus(t, k8sClient, lazyNode, repoPath, oci.DistributionKindBlob, layerDgst))
+		require.Contains(t, seedContent, layerDgst)
 	}
 }
 

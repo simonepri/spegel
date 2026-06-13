@@ -27,6 +27,7 @@ import (
 	"github.com/spegel-org/spegel/internal/version"
 	"github.com/spegel-org/spegel/pkg/httpx"
 	"github.com/spegel-org/spegel/pkg/metrics"
+	"github.com/spegel-org/spegel/pkg/estargz"
 	"github.com/spegel-org/spegel/pkg/oci"
 	"github.com/spegel-org/spegel/pkg/registry"
 	"github.com/spegel-org/spegel/pkg/routing"
@@ -68,6 +69,10 @@ type RegistryCmd struct {
 	MirrorResolveTimeout  time.Duration    `arg:"--mirror-resolve-timeout,env:MIRROR_RESOLVE_TIMEOUT" default:"20ms" help:"Max duration spent finding a mirror."`
 	MirrorResolveRetries  int              `arg:"--mirror-resolve-retries,env:MIRROR_RESOLVE_RETRIES" default:"3" help:"Max amount of mirrors to attempt."`
 	DebugWebEnabled       bool             `arg:"--debug-web-enabled,env:DEBUG_WEB_ENABLED" default:"true" help:"When true enables debug web page."`
+	EstargzCachePath      string           `arg:"--estargz-cache-path,env:ESTARGZ_CACHE_PATH" default:"" help:"Path to the http cache of the stargz snapshotter, enables serving lazily pulled blobs."`
+	EstargzMirrorURL      string           `arg:"--estargz-mirror-url,env:ESTARGZ_MIRROR_URL" default:"" help:"Mirror url configured in the stargz snapshotter resolver."`
+	EstargzChunkSize      int64            `arg:"--estargz-chunk-size,env:ESTARGZ_CHUNK_SIZE" default:"50000" help:"Chunk size configured in the stargz snapshotter."`
+	EstargzPollInterval   time.Duration    `arg:"--estargz-poll-interval,env:ESTARGZ_POLL_INTERVAL" default:"30s" help:"Interval at which lazily pulled blobs are checked for completeness."`
 }
 
 type CleanupCmd struct {
@@ -209,7 +214,25 @@ func registryCommand(ctx context.Context, args *RegistryCmd) error {
 	}
 
 	// OCI Store
-	ociStore, err := oci.NewContainerd(ctx, args.ContainerdSock, args.ContainerdNamespace, oci.WithContentPath(args.ContainerdContentPath))
+	ociOpts := []oci.ContainerdOption{oci.WithContentPath(args.ContainerdContentPath)}
+	if args.EstargzCachePath != "" {
+		if args.EstargzMirrorURL == "" {
+			return errors.New("estargz mirror url has to be set when the estargz cache path is set")
+		}
+		if args.DataDir == "" {
+			return errors.New("data dir has to be set when the estargz cache path is set")
+		}
+		u, err := url.Parse(args.EstargzMirrorURL)
+		if err != nil {
+			return err
+		}
+		backend, err := estargz.NewBackend(args.EstargzCachePath, filepath.Join(args.DataDir, "estargz"), *u, args.EstargzChunkSize)
+		if err != nil {
+			return err
+		}
+		ociOpts = append(ociOpts, oci.WithBlobBackend(backend, args.EstargzPollInterval))
+	}
+	ociStore, err := oci.NewContainerd(ctx, args.ContainerdSock, args.ContainerdNamespace, ociOpts...)
 	if err != nil {
 		return err
 	}

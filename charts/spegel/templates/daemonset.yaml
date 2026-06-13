@@ -121,6 +121,12 @@ spec:
           - --data-dir={{ .path }}
           {{- end }}
           {{- end }}
+          {{- if .Values.spegel.estargz.enabled }}
+          - --estargz-cache-path={{ .Values.spegel.estargz.cachePath }}
+          - --estargz-mirror-url={{ .Values.spegel.estargz.mirrorURL | default (printf "http://$(NODE_IP):%v" .Values.service.registry.nodePort) }}
+          - --estargz-chunk-size={{ .Values.spegel.estargz.chunkSize }}
+          - --estargz-poll-interval={{ .Values.spegel.estargz.pollInterval }}
+          {{- end }}
         env:
         {{- if ((.Values.resources).limits).memory }}
         - name: GOMEMLIMIT
@@ -179,6 +185,11 @@ spec:
             mountPath: {{ . }}
             readOnly: true
           {{- end }}
+          {{- if .Values.spegel.estargz.enabled }}
+          - name: estargz-cache
+            mountPath: {{ .Values.spegel.estargz.cachePath }}
+            readOnly: true
+          {{- end }}
         resources:
           {{- toYaml .Values.resources | nindent 10 }}
       volumes:
@@ -202,6 +213,12 @@ spec:
           hostPath:
             path: {{ . }}
             type: Directory
+        {{- end }}
+        {{- if .Values.spegel.estargz.enabled }}
+        - name: estargz-cache
+          hostPath:
+            path: {{ .Values.spegel.estargz.cachePath }}
+            type: DirectoryOrCreate
         {{- end }}
         {{- if .Values.spegel.containerdMirrorAdd }}
         - name: containerd-config

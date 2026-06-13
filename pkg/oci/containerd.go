@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
@@ -42,7 +43,9 @@ const (
 )
 
 type ContainerdConfig struct {
-	ContentPath string
+	ContentPath         string
+	BlobBackend         BlobBackend
+	BackendPollInterval time.Duration
 }
 
 type ContainerdOption = option.Option[ContainerdConfig]
@@ -54,16 +57,42 @@ func WithContentPath(path string) ContainerdOption {
 	}
 }
 
+// WithBlobBackend sets a backend which serves blobs that are missing from the content
+// store, like layers of lazily pulled images. Blobs which the backend reports as
+// complete are advertised and served as if they were present in the content store.
+func WithBlobBackend(backend BlobBackend, pollInterval time.Duration) ContainerdOption {
+	return func(c *ContainerdConfig) error {
+		c.BlobBackend = backend
+		c.BackendPollInterval = pollInterval
+		return nil
+	}
+}
+
 var _ Store = &Containerd{}
+
+// lazyBlob is a blob which is missing from the content store and may be served by the
+// blob backend. The descriptor comes from the manifest referencing the blob.
+type lazyBlob struct {
+	ref      Reference
+	desc     ocispec.Descriptor
+	complete bool
+}
 
 type Containerd struct {
 	client       *client.Client
 	mediaTypeIdx *lru.Cache[digest.Digest, string]
 	contentPath  string
+
+	backend             BlobBackend
+	backendPollInterval time.Duration
+	lazyMu              sync.RWMutex
+	lazyBlobs           map[digest.Digest]*lazyBlob
 }
 
 func NewContainerd(ctx context.Context, sock, namespace string, opts ...ContainerdOption) (*Containerd, error) {
-	cfg := ContainerdConfig{}
+	cfg := ContainerdConfig{
+		BackendPollInterval: 30 * time.Second,
+	}
 	err := option.Apply(&cfg, opts...)
 	if err != nil {
 		return nil, err
@@ -78,9 +107,12 @@ func NewContainerd(ctx context.Context, sock, namespace string, opts ...Containe
 		return nil, err
 	}
 	c := &Containerd{
-		client:       client,
-		mediaTypeIdx: mediaTypeIdx,
-		contentPath:  cfg.ContentPath,
+		client:              client,
+		mediaTypeIdx:        mediaTypeIdx,
+		contentPath:         cfg.ContentPath,
+		backend:             cfg.BlobBackend,
+		backendPollInterval: cfg.BackendPollInterval,
+		lazyBlobs:           map[digest.Digest]*lazyBlob{},
 	}
 	return c, nil
 }
@@ -138,6 +170,9 @@ func (c *Containerd) Resolve(ctx context.Context, ref string) (digest.Digest, er
 func (c *Containerd) Descriptor(ctx context.Context, dgst digest.Digest) (ocispec.Descriptor, error) {
 	info, err := c.client.ContentStore().Info(ctx, dgst)
 	if errors.Is(err, errdefs.ErrNotFound) {
+		if lb, ok := c.completeLazyBlob(dgst); ok {
+			return lb.desc, nil
+		}
 		return ocispec.Descriptor{}, errors.Join(ErrNotFound, err)
 	}
 	if err != nil {
@@ -180,6 +215,9 @@ func (c *Containerd) Open(ctx context.Context, dgst digest.Digest) (io.ReadSeekC
 		path := filepath.Join(c.contentPath, "blobs", dgst.Algorithm().String(), dgst.Encoded())
 		file, err := os.Open(path)
 		if errors.Is(err, os.ErrNotExist) {
+			if lb, ok := c.completeLazyBlob(dgst); ok {
+				return c.backend.Open(ctx, lb.ref, lb.desc.Size)
+			}
 			return nil, errors.Join(ErrNotFound, err)
 		}
 		if err != nil {
@@ -189,6 +227,9 @@ func (c *Containerd) Open(ctx context.Context, dgst digest.Digest) (io.ReadSeekC
 	}
 	ra, err := c.client.ContentStore().ReaderAt(ctx, ocispec.Descriptor{Digest: dgst})
 	if errors.Is(err, errdefs.ErrNotFound) {
+		if lb, ok := c.completeLazyBlob(dgst); ok {
+			return c.backend.Open(ctx, lb.ref, lb.desc.Size)
+		}
 		return nil, errors.Join(ErrNotFound, err)
 	}
 	if err != nil {
@@ -226,6 +267,7 @@ func (c *Containerd) Subscribe(ctx context.Context) (map[Image][]digest.Digest, 
 			continue
 		}
 		refs := []Reference{}
+		descs := map[digest.Digest]ocispec.Descriptor{}
 		handler := images.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
 			children, err := images.ChildrenHandler(c.client.ContentStore()).Handle(ctx, desc)
 			if errors.Is(err, errdefs.ErrNotFound) {
@@ -240,6 +282,7 @@ func (c *Containerd) Subscribe(ctx context.Context) (map[Image][]digest.Digest, 
 				Digest:     desc.Digest,
 			}
 			refs = append(refs, ref)
+			descs[desc.Digest] = desc
 			return children, nil
 		})
 		err = images.Walk(ctx, handler, cImg.Target)
@@ -257,15 +300,22 @@ func (c *Containerd) Subscribe(ctx context.Context) (map[Image][]digest.Digest, 
 			log.Error(err, "skipping image that cannot be checked for existing content", "image", img.String())
 			continue
 		}
+		c.registerLazyBlobs(refs, descs, dgsts)
 		initial[img] = dgsts
 	}
 
+	backendCh := make(chan OCIEvent)
+	if c.backend != nil {
+		go c.pollBackend(logr.NewContext(subCtx, log), backendCh)
+	}
 	go func() {
 		defer close(eventCh)
 		for {
 			select {
 			case <-subCtx.Done():
 				return
+			case event := <-backendCh:
+				eventCh <- event
 			case envelope := <-envelopeCh:
 				events, err := c.handleEvent(subCtx, *envelope, contentIdx)
 				if err != nil {
@@ -305,6 +355,85 @@ func (c *Containerd) existingDigests(ctx context.Context, refs []Reference) ([]d
 		dgsts = append(dgsts, ref.Digest)
 	}
 	return dgsts, nil
+}
+
+// registerLazyBlobs indexes references which are not part of the existing digests so
+// that the blob backend can serve them once they are complete. Completeness is
+// checked by the backend poller, which advertises the blobs that are complete.
+func (c *Containerd) registerLazyBlobs(refs []Reference, descs map[digest.Digest]ocispec.Descriptor, existing []digest.Digest) {
+	if c.backend == nil {
+		return
+	}
+	c.lazyMu.Lock()
+	defer c.lazyMu.Unlock()
+	for _, ref := range refs {
+		if slices.Contains(existing, ref.Digest) {
+			continue
+		}
+		desc, ok := descs[ref.Digest]
+		if !ok {
+			continue
+		}
+		if _, ok := c.lazyBlobs[ref.Digest]; !ok {
+			c.lazyBlobs[ref.Digest] = &lazyBlob{ref: ref, desc: desc}
+		}
+	}
+}
+
+// completeLazyBlob returns the lazy blob for the digest if it is complete.
+func (c *Containerd) completeLazyBlob(dgst digest.Digest) (*lazyBlob, bool) {
+	if c.backend == nil {
+		return nil, false
+	}
+	c.lazyMu.RLock()
+	defer c.lazyMu.RUnlock()
+	lb, ok := c.lazyBlobs[dgst]
+	return lb, ok && lb.complete
+}
+
+// pollBackend periodically checks the completeness of lazy blobs, advertising blobs
+// which have become complete and withdrawing blobs which are no longer complete, for
+// example when the backend cache is garbage collected.
+func (c *Containerd) pollBackend(ctx context.Context, eventCh chan<- OCIEvent) {
+	log := logr.FromContextOrDiscard(ctx)
+	ticker := time.NewTicker(c.backendPollInterval)
+	defer ticker.Stop()
+	for {
+		c.lazyMu.RLock()
+		lbs := make([]*lazyBlob, 0, len(c.lazyBlobs))
+		for _, lb := range c.lazyBlobs {
+			lbs = append(lbs, lb)
+		}
+		c.lazyMu.RUnlock()
+		for _, lb := range lbs {
+			complete, err := c.backend.Complete(ctx, lb.ref, lb.desc.Size)
+			if err != nil {
+				log.Error(err, "could not check blob completeness", "digest", lb.ref.Digest.String())
+				continue
+			}
+			c.lazyMu.Lock()
+			changed := lb.complete != complete
+			lb.complete = complete
+			c.lazyMu.Unlock()
+			if !changed {
+				continue
+			}
+			eventType := CreateEvent
+			if !complete {
+				eventType = DeleteEvent
+			}
+			select {
+			case eventCh <- OCIEvent{Type: eventType, Reference: lb.ref}:
+			case <-ctx.Done():
+				return
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func (c *Containerd) handleEvent(ctx context.Context, envelope events.Envelope, contentIdx map[digest.Digest][]Reference) ([]OCIEvent, error) {
@@ -352,6 +481,7 @@ func (c *Containerd) handleEvent(ctx context.Context, envelope events.Envelope, 
 			return nil, err
 		}
 		refs := []Reference{}
+		descs := map[digest.Digest]ocispec.Descriptor{}
 		handler := images.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
 			children, err := images.ChildrenHandler(c.client.ContentStore()).Handle(ctx, desc)
 			if errors.Is(err, errdefs.ErrNotFound) {
@@ -366,6 +496,7 @@ func (c *Containerd) handleEvent(ctx context.Context, envelope events.Envelope, 
 				Digest:     desc.Digest,
 			}
 			refs = append(refs, ref)
+			descs[desc.Digest] = desc
 			return children, nil
 		})
 		err = images.Walk(ctx, handler, cImg.Target)
@@ -373,6 +504,10 @@ func (c *Containerd) handleEvent(ctx context.Context, envelope events.Envelope, 
 			return nil, err
 		}
 		contentIdx[img.Digest] = refs
+		// Existence is not checked to keep event handling fast. Blobs which are present
+		// in the content store never become complete in the backend and are served from
+		// the content store, making their registration harmless.
+		c.registerLazyBlobs(refs, descs, nil)
 		return nil, nil
 	case *eventtypes.ImageDelete:
 		img, err := ParseImage(e.GetName(), AllowTagOnly())
@@ -407,6 +542,9 @@ func (c *Containerd) handleEvent(ctx context.Context, envelope events.Envelope, 
 		// Create delete events for contents that has been removed.
 		events := []OCIEvent{}
 		for _, ref := range refs {
+			c.lazyMu.Lock()
+			delete(c.lazyBlobs, ref.Digest)
+			c.lazyMu.Unlock()
 			_, err := c.client.ContentStore().Info(ctx, ref.Digest)
 			if err == nil {
 				continue

@@ -158,6 +158,17 @@ spegel:
     path: "/var/lib/spegel"
     # -- Path on host which is mounted to container.
     hostPath: "/var/lib/spegel"
+  estargz:
+    # -- If true Spegel will serve lazily pulled blobs from the stargz snapshotter cache.
+    enabled: false
+    # -- Path on the host to the http cache of the stargz snapshotter.
+    cachePath: "/var/lib/containerd-stargz-grpc/stargz/httpcache"
+    # -- Mirror url configured in the resolver of the stargz snapshotter. Defaults to the local Spegel mirror.
+    mirrorURL: ""
+    # -- Chunk size configured in the stargz snapshotter.
+    chunkSize: 50000
+    # -- Interval at which lazily pulled blobs are checked for completeness.
+    pollInterval: "30s"
   # -- Registries for which mirror configuration will be created. Empty means all registires will be mirrored.
   mirroredRegistries: []
     # - https://docker.io
